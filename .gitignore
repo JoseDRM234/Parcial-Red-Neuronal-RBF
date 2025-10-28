@@ -1,0 +1,70 @@
+# ============================================
+#  PROYECTO: Red Neuronal RBF (Python + Tkinter)
+# ============================================
+
+# --- Carpetas de entorno virtual ---
+venv/
+.env/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Archivos de configuración del sistema ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Archivos temporales o de usuario ---
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# --- Configuración de Visual Studio Code / PyCharm ---
+.vscode/
+.idea/
+
+# --- Archivos creados automáticamente por PyInstaller o build ---
+*.spec
+*.egg
+*.egg-info/
+dist/
+build/
+
+# --- Resultados generados por la aplicación ---
+resultados/
+output/
+logs/
+temp/
+cache/
+matriz_A.csv
+*_train.csv
+*_test.csv
+resultados_entrenamiento.csv
+
+# --- Archivos de modelo y entrenamiento ---
+*.npy
+*.npz
+*.sav
+*.pkl
+
+# --- Credenciales de Google Drive ---
+token.json
+credentials.json
+client_secrets.json
+
+# --- Dependencias locales ---
+*.db
+*.sqlite3
+
+# --- Archivos de Jupyter o temporales ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Archivos del sistema Windows / Mac ---
+ehthumbs.db
+Icon?
+$RECYCLE.BIN/
