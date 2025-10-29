@@ -6,7 +6,9 @@ Soporta datasets CSV, Excel y JSON, incluyendo columnas de texto.
 import os
 import json
 import pandas as pd
+from datetime import datetime
 import numpy as np
+from .utils import ensure_dir
 from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import LabelEncoder
 
@@ -163,49 +165,197 @@ def save_results(results_dict, base_name="resultados_rbf"):
 
 # -------------------- Guardado de modelos --------------------
 def save_model_json_csv(model_obj, scaler, meta, last_eval, base_name="modelo_rbf"):
-    """Guarda modelo en JSON y CSV"""
+    """Guarda el modelo en JSON y también exporta centros/pesos a CSV"""
+    ensure_dir(MODELS_DIR)
+
+    # --- Conversión segura ---
+    def to_list_safe(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, dict):
+            return {k: to_list_safe(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [to_list_safe(x) for x in obj]
+        else:
+            return obj
+
+    # --- Guardar JSON ---
     json_path = os.path.join(MODELS_DIR, f"{base_name}.json")
     model_data = {
         "n_centers": int(model_obj.n_centers),
-        "centers": model_obj.centers.tolist() if model_obj.centers is not None else None,
-        "weights": model_obj.weights.tolist() if model_obj.weights is not None else None,
-        "scaler_mean": scaler.mean_.tolist() if scaler else None,
-        "scaler_std": scaler.scale_.tolist() if scaler else None,
-        "meta": meta,
-        "last_eval": last_eval
+        "centers": to_list_safe(model_obj.centers),
+        "weights": to_list_safe(model_obj.weights),
+        "scaler_mean": to_list_safe(scaler.mean_) if scaler else None,
+        "scaler_std": to_list_safe(scaler.scale_) if scaler else None,
+        "meta": to_list_safe(meta),
+        "last_eval": to_list_safe(last_eval)
     }
+
     with open(json_path, "w", encoding="utf8") as f:
         json.dump(model_data, f, indent=2, ensure_ascii=False)
-    
-    # Guardar centros y pesos en CSV
+
+    # --- Guardar también CSV (centros y pesos) ---
     centers_path = os.path.join(MODELS_DIR, f"{base_name}_centros.csv")
     if model_obj.centers is not None:
         pd.DataFrame(model_obj.centers).to_csv(centers_path, index=False)
-    
+
     weights_path = os.path.join(MODELS_DIR, f"{base_name}_pesos.csv")
     if model_obj.weights is not None:
         pd.DataFrame({"W": model_obj.weights}).to_csv(weights_path, index=False)
-    
+
     return json_path, centers_path, weights_path
 
+
 # -------------------- Carga de modelos --------------------
-def load_model_json(json_path):
-    """Carga modelo desde JSON"""
+def load_model_json(model_path):
+    """
+    Carga un modelo entrenado desde JSON o CSV.
+    Devuelve: (model, scaler, meta, last_eval)
+    """
     from .model_rbf import RBFModel
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"No se encontró el modelo: {model_path}")
+
+    ext = os.path.splitext(model_path)[1].lower()
+
+    if ext == ".json":
+        # Cargar modelo completo
+        with open(model_path, "r", encoding="utf8") as f:
+            data = json.load(f)
+
+        model = RBFModel(n_centers=int(data["n_centers"]))
+        model.centers = np.array(data["centers"]) if data.get("centers") else None
+        model.weights = np.array(data["weights"]) if data.get("weights") else None
+        model.trained = model.weights is not None
+
+        scaler = None
+        if data.get("scaler_mean") and data.get("scaler_std"):
+            scaler = StandardScaler()
+            scaler.mean_ = np.array(data["scaler_mean"])
+            scaler.scale_ = np.array(data["scaler_std"])
+            scaler.n_features_in_ = len(scaler.mean_)
+
+        meta = data.get("meta", {})
+        last_eval = data.get("last_eval", {})
+
+        return model, scaler, meta, last_eval
+
+    elif ext == ".csv":
+        # Cargar pesos o centros desde CSV
+        if "centros" in model_path:
+            df = pd.read_csv(model_path)
+            centers = df.to_numpy()
+            model = RBFModel(n_centers=centers.shape[0])
+            model.centers = centers
+            return model, None, None, None
+        elif "pesos" in model_path:
+            df = pd.read_csv(model_path)
+            model = RBFModel(n_centers=len(df))
+            model.weights = df["W"].to_numpy().reshape(-1, 1)
+            return model, None, None, None
+        else:
+            raise ValueError("Archivo CSV no reconocido (use *_centros.csv o *_pesos.csv).")
+
+    else:
+        raise ValueError("Formato de modelo no soportado. Use .json o .csv")
     
-    with open(json_path, "r", encoding="utf8") as f:
+# -------------------- Guardado / Carga TODO en uno --------------------
+def save_full_model(model, scaler, meta, last_eval, X_train, Y_train, X_test, Y_test, A, results, base_name="modelo_completo_rbf"):
+    """
+    Guarda TODO el estado del modelo (config, centros, pesos, métricas, dataset dividido, matriz A)
+    en un único archivo JSON para recargarlo y simular sin reentrenar.
+    """
+    ensure_dir(MODELS_DIR)
+    full_path = os.path.join(MODELS_DIR, f"{base_name}.json")
+
+    def to_list_safe(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, dict):
+            return {k: to_list_safe(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [to_list_safe(x) for x in obj]
+        else:
+            return obj
+
+    full_data = {
+        "config": {
+            "n_centers": int(model.n_centers),
+            "error_opt": results.get("config", {}).get("error_opt", None),
+        },
+        "centers": to_list_safe(model.centers),
+        "weights": to_list_safe(model.weights),
+        "matriz_A": to_list_safe(A),
+        "scaler_mean": to_list_safe(scaler.mean_) if scaler else None,
+        "scaler_std": to_list_safe(scaler.scale_) if scaler else None,
+        "meta": to_list_safe(meta),
+        "last_eval": to_list_safe(last_eval),
+        "train_data": {
+            "X_train": to_list_safe(X_train),
+            "Y_train": to_list_safe(Y_train)
+        },
+        "test_data": {
+            "X_test": to_list_safe(X_test),
+            "Y_test": to_list_safe(Y_test)
+        },
+        "metrics": {
+            "EG_train": results.get("EG_train"),
+            "MAE_train": results.get("MAE_train"),
+            "RMSE_train": results.get("RMSE_train"),
+            "EG_test": results.get("EG_test"),
+            "MAE_test": results.get("MAE_test"),
+            "RMSE_test": results.get("RMSE_test"),
+            "convergencia_train": results.get("convergencia_train")
+        }
+    }
+
+    with open(full_path, "w", encoding="utf-8") as f:
+        json.dump(full_data, f, indent=2, ensure_ascii=False)
+
+    return full_path
+
+
+def load_full_model(path):
+    """
+    Carga el archivo JSON completo (modelo + resultados + dataset dividido)
+    para continuar simulando directamente sin reentrenar.
+    """
+    from .model_rbf import RBFModel
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No se encontró el archivo: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
-    model = RBFModel(n_centers=data["n_centers"])
-    model.centers = np.array(data["centers"]) if data["centers"] else None
-    model.weights = np.array(data["weights"]) if data["weights"] else None
-    model.trained = model.weights is not None
-    
+
+    model = RBFModel(n_centers=data["config"]["n_centers"])
+    model.centers = np.array(data["centers"])
+    model.weights = np.array(data["weights"])
+    model.trained = True
+
     scaler = None
-    if data["scaler_mean"] and data["scaler_std"]:
+    if data.get("scaler_mean") and data.get("scaler_std"):
         scaler = StandardScaler()
         scaler.mean_ = np.array(data["scaler_mean"])
         scaler.scale_ = np.array(data["scaler_std"])
         scaler.n_features_in_ = len(scaler.mean_)
-    
-    return model, scaler, data["meta"], data["last_eval"]
+
+    meta = data.get("meta")
+    last_eval = data.get("last_eval")
+
+    # Reconstrucción del dataset
+    X_train = np.array(data["train_data"]["X_train"])
+    Y_train = np.array(data["train_data"]["Y_train"])
+    X_test = np.array(data["test_data"]["X_test"])
+    Y_test = np.array(data["test_data"]["Y_test"])
+
+    return model, scaler, meta, last_eval, X_train, Y_train, X_test, Y_test

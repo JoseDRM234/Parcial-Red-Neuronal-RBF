@@ -17,7 +17,7 @@ from .data_manager import (
     split_train_test, save_results, save_model_json_csv, load_model_json,
     RESULTS_DIR, MODELS_DIR, DATASETS_DIR
 )
-from .drive_utils import upload_to_drive, list_drive_files, download_from_drive, Pydrive_available
+from .drive_utils import upload_to_drive, read_file_from_drive, list_drive_files, download_from_drive, Pydrive_available
 import json
 
 class RBFApp(tk.Tk):
@@ -95,7 +95,7 @@ class RBFApp(tk.Tk):
         frm_local = ttk.LabelFrame(f, text="📁 Carga Local", padding=10)
         frm_local.pack(fill="x", padx=20, pady=10)
         
-        ttk.Button(frm_local, text="Seleccionar archivo CSV/XLSX", 
+        ttk.Button(frm_local, text="Seleccionar archivo CSV/XLSX/JSON", 
                   command=self.load_local_dataset, width=30).pack(pady=5)
         
         # Frame para Google Drive
@@ -108,6 +108,10 @@ class RBFApp(tk.Tk):
         ttk.Label(frm_drive, text="Archivos disponibles:").pack(anchor="w", pady=5)
         self.drive_listbox = tk.Listbox(frm_drive, height=5)
         self.drive_listbox.pack(fill="x", pady=5)
+        
+           # Botón para cargar directamente
+        ttk.Button(frm_drive, text="📥 Cargar seleccionado",
+                command=self.load_from_drive_direct, width=30).pack(pady=5)
         
         ttk.Button(frm_drive, text="📥 Descargar seleccionado", 
                   command=self.download_selected_from_drive).pack(pady=5)
@@ -168,23 +172,90 @@ class RBFApp(tk.Tk):
             import traceback
             traceback.print_exc()
             messagebox.showerror("Error", f"Error al cargar dataset:\n{str(e)}")
+            
+    # ==================== Dentro de la clase RBFApp ====================
 
     def authenticate_drive(self):
+        """Autentica con Google Drive y lista archivos compatibles (CSV, XLSX, JSON, modelo)"""
         if not Pydrive_available:
             messagebox.showerror("Error", "pydrive2 no está instalado.\nInstale con: pip install pydrive2")
             return
-        
         try:
-            files = list_drive_files("title contains '.csv' or title contains '.xlsx'")
+             # 🔹 Filtra solo archivos .csv o .json en Google Drive
+            query = (
+                "trashed=false and "
+                "(title contains '.csv' or title contains '.json')"
+            )
+            files = list_drive_files(query)
             self.drive_files = files
-            
+            # Limpiar lista
             self.drive_listbox.delete(0, tk.END)
-            for title, fid in files:
-                self.drive_listbox.insert(tk.END, f"{title} (ID: {fid[:10]}...)")
-            
-            messagebox.showinfo("Drive", f"✅ Autenticado. {len(files)} archivos encontrados")
+
+            for title, fid, mime in files:
+                # Mostrar el tipo MIME al usuario (útil para diferenciar datasets o modelos)
+                if "csv" in mime or "excel" in mime:
+                    tag = "📊 Dataset"
+                elif "json" in mime:
+                    tag = "🧠 Modelo/JSON"
+                else:
+                    tag = "📄 Otro"
+                self.drive_listbox.insert(tk.END, f"{tag}  {title}  ({fid[:10]}...)")
+
+            messagebox.showinfo("Drive", f"✅ Autenticado. {len(files)} archivos encontrados.")
+
         except Exception as e:
-            messagebox.showerror("Error Drive", str(e))
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error Drive", f"❌ Error durante autenticación:\n{str(e)}")
+
+
+# ==================== Dentro de la clase RBFApp ====================
+    def load_from_drive_direct(self):
+        sel = self.drive_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Aviso", "Seleccione un archivo de la lista")
+            return
+
+        idx = sel[0]
+        title, fid, mime = self.drive_files[idx]
+        try:
+            df_or_json = read_file_from_drive(fid)
+
+            if isinstance(df_or_json, dict) and "weights" in df_or_json:
+                # Cargar modelo desde JSON
+                from .model_rbf import RBFModel
+                import numpy as np
+                from sklearn.preprocessing import StandardScaler
+
+                model = RBFModel(n_centers=df_or_json.get("n_centers", 2))
+                model.centers = np.array(df_or_json.get("centers", []))
+                model.weights = np.array(df_or_json.get("weights", []))
+                model.trained = True
+
+                scaler = None
+                if df_or_json.get("scaler_mean") and df_or_json.get("scaler_std"):
+                    scaler = StandardScaler()
+                    scaler.mean_ = np.array(df_or_json["scaler_mean"])
+                    scaler.scale_ = np.array(df_or_json["scaler_std"])
+                    scaler.n_features_in_ = len(scaler.mean_)
+
+                self.model = model
+                self.scaler = scaler
+                self.meta = df_or_json.get("meta")
+                self.last_eval = df_or_json.get("last_eval")
+
+                messagebox.showinfo("Modelo cargado", f"✅ Modelo '{title}' abierto desde Drive")
+
+            else:
+                # Cargar dataset desde CSV
+                df = df_or_json
+                self.X, self.Y, self.meta = detect_xy_from_df(df)
+                self.X, self.scaler = preprocess(self.X)
+                messagebox.showinfo("Dataset cargado", f"✅ Dataset '{title}' abierto desde Drive")
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            messagebox.showerror("Error", f"❌ Error al leer archivo desde Drive:\n{str(e)}")
 
     def download_selected_from_drive(self):
         sel = self.drive_listbox.curselection()
@@ -280,63 +351,121 @@ class RBFApp(tk.Tk):
             self.centers_tree.insert("", "end", values=(f"Centro {i}", coords_str))
 
     def init_centers_random(self):
+        """Inicializa los centros radiales aleatoriamente con validación profesional."""
         if self.X is None:
-            messagebox.showwarning("Aviso", "Cargue un dataset primero")
+            messagebox.showwarning("Aviso", "Cargue un dataset primero.")
             return
-        
-        n = int(self.n_centers_var.get())
-        if n < 2:
-            messagebox.showwarning("Aviso", "Debe tener al menos 2 centros")
-            return
-        
-        self.model = RBFModel(n_centers=n, random_state=42)
-        self.model.initialize_centers(self.X)
-        self._populate_centers_view(self.model.centers)
-        messagebox.showinfo("Centros", f"✅ {n} centros inicializados aleatoriamente")
+
+        try:
+            n = int(self.n_centers_var.get())
+            n_inputs = self.X.shape[1]
+
+            # Validar mínimo 2 centros
+            if n < 2:
+                messagebox.showwarning(
+                    "Aviso",
+                    "Debe tener al menos 2 centros radiales.\n"
+                    "El valor se ajustará automáticamente a 2."
+                )
+                n = 2
+                self.n_centers_var.set(2)
+
+            # Validar que no sea menor que el número de entradas
+            elif n < n_inputs:
+                messagebox.showwarning(
+                    "Aviso",
+                    f"El número de centros ({n}) es menor que el número de variables de entrada ({n_inputs}).\n"
+                    f"Se ajustará automáticamente a {n_inputs}."
+                )
+                n = n_inputs
+                self.n_centers_var.set(n_inputs)
+
+            # Inicializar el modelo
+            self.model = RBFModel(n_centers=n, random_state=42)
+            self.model.initialize_centers(self.X)
+
+            # Mostrar centros en la vista
+            self._populate_centers_view(self.model.centers)
+
+            messagebox.showinfo(
+                "Centros inicializados",
+                f"✅ {n} centros radiales inicializados correctamente."
+            )
+
+        except ValueError:
+            messagebox.showerror("Error", "Ingrese un número válido para los centros radiales.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al inicializar centros:\n{str(e)}")
+
 
     def add_center_random(self):
+        """Agrega un nuevo centro radial aleatorio dentro del rango de los datos."""
         if self.X is None:
-            messagebox.showwarning("Aviso", "Cargue dataset primero")
+            messagebox.showwarning("Aviso", "Cargue un dataset primero.")
             return
-        
-        if self.model is None:
-            self.model = RBFModel(n_centers=0, random_state=42)
-            self.model.centers = np.empty((0, self.X.shape[1]))
-        
-        mins = self.X.min(axis=0)
-        maxs = self.X.max(axis=0)
-        coords = np.random.uniform(mins, maxs)
-        self.model.add_center(coords)
-        self._populate_centers_view(self.model.centers)
-        messagebox.showinfo("Centro", "✅ Centro aleatorio agregado")
+
+        try:
+            if self.model is None:
+                self.model = RBFModel(n_centers=0, random_state=42)
+                self.model.centers = np.empty((0, self.X.shape[1]))
+
+            mins = self.X.min(axis=0)
+            maxs = self.X.max(axis=0)
+            coords = np.random.uniform(mins, maxs)
+            self.model.add_center(coords)
+
+            self._populate_centers_view(self.model.centers)
+
+            messagebox.showinfo(
+                "Centro agregado",
+                f"✅ Centro radial aleatorio agregado.\n\n"
+                f"Total actual: {self.model.n_centers} centros."
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo agregar el centro:\n{str(e)}")
+
 
     def add_center_manual(self):
+        """Permite al usuario ingresar manualmente un nuevo centro radial."""
         if self.X is None:
-            messagebox.showwarning("Aviso", "Cargue dataset primero")
+            messagebox.showwarning("Aviso", "Cargue un dataset primero.")
             return
-        
+
         n_features = self.X.shape[1]
         prompt = f"Ingrese {n_features} valores separados por comas:"
         s = simpledialog.askstring("Centro Manual", prompt)
-        
+
         if not s:
             return
-        
+
         try:
             parts = [float(x.strip()) for x in s.split(",")]
             if len(parts) != n_features:
-                messagebox.showerror("Error", f"Debe ingresar {n_features} valores")
+                messagebox.showerror(
+                    "Error",
+                    f"Debe ingresar exactamente {n_features} valores numéricos."
+                )
                 return
-            
+
             if self.model is None:
                 self.model = RBFModel(n_centers=0, random_state=42)
                 self.model.centers = np.empty((0, n_features))
-            
+
             self.model.add_center(parts)
             self._populate_centers_view(self.model.centers)
-            messagebox.showinfo("Centro", "✅ Centro manual agregado")
+
+            messagebox.showinfo(
+                "Centro agregado",
+                f"✅ Centro manual agregado correctamente.\n\n"
+                f"Total actual: {self.model.n_centers} centros."
+            )
+
+        except ValueError:
+            messagebox.showerror("Error", "Debe ingresar solo valores numéricos separados por comas.")
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", f"Error al agregar centro manual:\n{str(e)}")
+
 
     def remove_selected_center(self):
         sel = self.centers_tree.selection()
@@ -364,24 +493,40 @@ class RBFApp(tk.Tk):
     # ==================== TAB 3: ENTRENAMIENTO ====================
     def _build_tab_train(self):
         f = self.tab_train
-        
+
         ttk.Label(f, text="Entrenamiento de la Red RBF", style="Title.TLabel").pack(pady=10)
-        
+
+        # ------------------------------------------------------------
         # Botones principales
+        # ------------------------------------------------------------
         frm_btns = ttk.Frame(f)
         frm_btns.pack(fill="x", padx=20, pady=10)
-        
-        ttk.Button(frm_btns, text="🚀 Entrenar Modelo", 
-                  command=self.train_model, width=20).pack(side="left", padx=5)
-        ttk.Button(frm_btns, text="💾 Guardar Modelo (JSON/CSV)", 
-                  command=self.save_model_dialog, width=25).pack(side="left", padx=5)
-        ttk.Button(frm_btns, text="📂 Cargar Modelo (JSON)", 
-                  command=self.load_model_dialog, width=20).pack(side="left", padx=5)
-        ttk.Button(frm_btns, text="☁️ Subir a Drive", 
-                  command=self.upload_model_to_drive, width=15).pack(side="left", padx=5)
-        
-        # Área de resultados
-        ttk.Label(f, text="📋 Log de Entrenamiento:").pack(anchor="w", padx=20, pady=(10,5))
+
+        ttk.Button(
+            frm_btns,
+            text="🚀 Entrenar Modelo",
+            command=self.train_model,
+            width=20
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            frm_btns,
+            text="💾 Guardar Modelo (JSON/CSV)",
+            command=self.save_model_dialog,
+            width=25
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            frm_btns,
+            text="☁️ Subir a Drive",
+            command=self.upload_model_to_drive,
+            width=15
+        ).pack(side="left", padx=5)
+
+        # ------------------------------------------------------------
+        # Área de resultados (Log de entrenamiento)
+        # ------------------------------------------------------------
+        ttk.Label(f, text="📋 Log de Entrenamiento:").pack(anchor="w", padx=20, pady=(10, 5))
         self.txt_train = tk.Text(f, height=28, width=120, font=("Consolas", 9))
         self.txt_train.pack(padx=20, pady=5, fill="both", expand=True)
 
@@ -389,21 +534,36 @@ class RBFApp(tk.Tk):
         if self.X is None:
             messagebox.showerror("Error", "Cargue un dataset primero")
             return
-        
+
         try:
             # ============================================================
-            # PASO 1: Preparación general
+            # PASO 1: Validación de configuración
+            # ============================================================
+            n_centers = int(self.n_centers_var.get())
+            n_inputs = self.X.shape[1]
+
+            if n_centers < n_inputs:
+                messagebox.showwarning(
+                    "Configuración inválida",
+                    f"⚠️ El número de centros ({n_centers}) debe ser al menos igual "
+                    f"al número de entradas del dataset ({n_inputs}).\n\n"
+                    f"💡 Recomendación: Use al menos {n_inputs} centros."
+                )
+                return
+
+            # ============================================================
+            # PASO 2: Preparación general
             # ============================================================
             train_pct = self.train_pct_var.get() / 100
             test_pct = 1 - train_pct
 
             self.txt_train.delete("1.0", tk.END)
-            self.txt_train.insert(tk.END, "="*80 + "\n")
+            self.txt_train.insert(tk.END, "=" * 80 + "\n")
             self.txt_train.insert(tk.END, "ENTRENAMIENTO DE RED NEURONAL RBF\n")
-            self.txt_train.insert(tk.END, "="*80 + "\n\n")
+            self.txt_train.insert(tk.END, "=" * 80 + "\n\n")
 
             # ============================================================
-            # PASO 2: Partición del dataset
+            # PASO 3: Partición del dataset
             # ============================================================
             self.txt_train.insert(tk.END, "📊 PASO 3: Partición del Dataset\n")
             self.X_train, self.Y_train, self.X_test, self.Y_test, split_info = split_train_test(
@@ -413,11 +573,10 @@ class RBFApp(tk.Tk):
             self.txt_train.insert(tk.END, f"  ✅ Prueba: {split_info['N_test']} patrones ({split_info['pct_test']:.1f}%)\n\n")
 
             # ============================================================
-            # PASO 3: Configuración de la red
+            # PASO 4: Configuración de la red
             # ============================================================
             self.txt_train.insert(tk.END, "⚙️ PASO 4: Configuración de la Red\n")
             if self.model is None or self.model.centers is None:
-                n_centers = int(self.n_centers_var.get())
                 self.model = RBFModel(n_centers=n_centers, random_state=42, use_pdf=True)
                 self.model.initialize_centers(self.X_train)
                 self.txt_train.insert(tk.END, f"  ✅ Centros inicializados: {n_centers}\n")
@@ -428,39 +587,45 @@ class RBFApp(tk.Tk):
             self.txt_train.insert(tk.END, f"  ✅ Error óptimo: {self.error_opt_var.get()}\n\n")
 
             # ============================================================
-            # PASO 4: Cálculo de distancias y activaciones
+            # PASO 5-6: Cálculo de Distancias y Activaciones
             # ============================================================
             self.txt_train.insert(tk.END, "🔢 PASO 5-6: Cálculo de Distancias y Activaciones\n")
 
+            # Entrenamiento del modelo (obtiene matriz A y pesos)
             A, weights = self.model.train(self.X_train, self.Y_train)
+
+            # Crear carpeta de resultados si no existe
+            os.makedirs(RESULTS_DIR, exist_ok=True)
 
             # Mostrar información general de la matriz A
             self.txt_train.insert(tk.END, f"  ✅ Matriz A construida correctamente\n")
             self.txt_train.insert(tk.END, f"     Dimensiones: {A.shape[0]} patrones x {A.shape[1]} columnas\n")
             self.txt_train.insert(tk.END, f"     Columnas → [1 (bias) + {self.model.n_centers} activaciones radiales]\n\n")
 
-            # Mostrar encabezados de columnas
+            # Construir encabezados de columnas
             cols_header = ["Bias"] + [f"Φ{j+1}" for j in range(self.model.n_centers)]
-            self.txt_train.insert(tk.END, f"📋 Columnas de la matriz A:\n  {cols_header}\n\n")
 
-            # Mostrar primeras 10 filas
-            self.txt_train.insert(tk.END, "🔍 Primeros 10 patrones de la matriz A:\n")
-            max_rows_to_show = min(10, A.shape[0])
-            for i in range(max_rows_to_show):
-                row_values = ", ".join([f"{val:.6f}" for val in A[i]])
-                self.txt_train.insert(tk.END, f"  Patrón {i+1}: [{row_values}]\n")
-            if A.shape[0] > 10:
-                self.txt_train.insert(tk.END, f"  ... ({A.shape[0]-10} filas adicionales ocultas)\n")
-            self.txt_train.insert(tk.END, "\n")
+            # Mostrar matriz A completa en el cuadro de texto
+            self.txt_train.insert(tk.END, "📋 MATRIZ A COMPLETA:\n")
+            self.txt_train.insert(tk.END, "-" * 100 + "\n")
+            self.txt_train.insert(tk.END, " | ".join([f"{h:^12}" for h in cols_header]) + "\n")
+            self.txt_train.insert(tk.END, "-" * 100 + "\n")
+
+            for i, row in enumerate(A):
+                formatted_row = " | ".join([f"{val:>12.6f}" for val in row])
+                self.txt_train.insert(tk.END, f"Fila {i+1:>3}: {formatted_row}\n")
+
+            self.txt_train.insert(tk.END, "-" * 100 + "\n\n")
 
             # Guardar matriz A en CSV
-            import pandas as pd, os
+            import pandas as pd
             df_A = pd.DataFrame(A, columns=cols_header)
-            df_A.to_csv(os.path.join(RESULTS_DIR, "matriz_A.csv"), index=False)
-            self.txt_train.insert(tk.END, f"💾 Matriz A guardada en: resultados/matriz_A.csv\n\n")
+            path_A = os.path.join(RESULTS_DIR, "matriz_A.csv")
+            df_A.to_csv(path_A, index=False)
+            self.txt_train.insert(tk.END, f"💾 Matriz A guardada en: {path_A}\n\n")
 
             # ============================================================
-            # PASO 5: Cálculo de pesos
+            # PASO 6: Cálculo de Pesos
             # ============================================================
             self.txt_train.insert(tk.END, "🧠 PASO 7: Cálculo de Pesos (Mínimos Cuadrados)\n")
             self.txt_train.insert(tk.END, f"  W₀ (bias) = {weights[0]:.8f}\n")
@@ -469,40 +634,67 @@ class RBFApp(tk.Tk):
             self.txt_train.insert(tk.END, "\n")
 
             # ============================================================
-            # PASO 6: Evaluación del modelo
+            # PASO 7: Evaluación del Modelo
             # ============================================================
             self.txt_train.insert(tk.END, "📊 PASO 9: Evaluación del Modelo\n\n")
             eval_train = self.model.evaluate(self.X_train, self.Y_train)
             eval_test = self.model.evaluate(self.X_test, self.Y_test)
 
-            # Mostrar métricas principales
-            self.txt_train.insert(tk.END, f"📈 CONJUNTO DE ENTRENAMIENTO ({split_info['pct_train']:.0f}%):\n")
-            self.txt_train.insert(tk.END, f"  • EG (Error General)        = {eval_train['EG']:.8f}\n")
-            self.txt_train.insert(tk.END, f"  • MAE (Error Abs. Medio)    = {eval_train['MAE']:.8f}\n")
-            self.txt_train.insert(tk.END, f"  • RMSE (Raíz Error Cuad.)   = {eval_train['RMSE']:.8f}\n\n")
+            # ============================================================
+            # MÉTRICAS COMPLETAS
+            # ============================================================
+            self.txt_train.insert(tk.END, "📈 MÉTRICAS DE EVALUACIÓN:\n")
 
-            self.txt_train.insert(tk.END, f"📉 CONJUNTO DE PRUEBA ({split_info['pct_test']:.0f}%):\n")
-            self.txt_train.insert(tk.END, f"  • EG (Error General)        = {eval_test['EG']:.8f}\n")
-            self.txt_train.insert(tk.END, f"  • MAE (Error Abs. Medio)    = {eval_test['MAE']:.8f}\n")
-            self.txt_train.insert(tk.END, f"  • RMSE (Raíz Error Cuad.)   = {eval_test['RMSE']:.8f}\n\n")
+            # --- Entrenamiento ---
+            self.txt_train.insert(tk.END, f"  ENTRENAMIENTO:\n")
+            self.txt_train.insert(tk.END, f"    • EG:   {eval_train['EG']:.8f}\n")
+            self.txt_train.insert(tk.END, f"    • MAE:  {eval_train['MAE']:.8f}\n")
+            self.txt_train.insert(tk.END, f"    • RMSE: {eval_train['RMSE']:.8f}\n")
 
-            # Mostrar tabla Yd vs Yr (primeros 10)
-            self.txt_train.insert(tk.END, "🔎 COMPARACIÓN Yd vs Yr (Primeros 10 patrones de entrenamiento):\n")
-            self.txt_train.insert(tk.END, f"{'Patrón':<10} {'Yd (Deseada)':<20} {'Yr (Predicha)':<20} {'Error':<20}\n")
+            # --- Prueba ---
+            self.txt_train.insert(tk.END, f"\n  PRUEBA:\n")
+            self.txt_train.insert(tk.END, f"    • EG:   {eval_test['EG']:.8f}\n")
+            self.txt_train.insert(tk.END, f"    • MAE:  {eval_test['MAE']:.8f}\n")
+            self.txt_train.insert(tk.END, f"    • RMSE: {eval_test['RMSE']:.8f}\n\n")
+
+            # ============================================================
+            # DETALLE DE SALIDAS
+            # ============================================================
+            self.txt_train.insert(tk.END, "🔎 DETALLE DE SALIDAS (Entrenamiento):\n")
+            self.txt_train.insert(tk.END, f"{'Patrón':<10} {'Yd (Deseada)':<20} {'Yr (Predicha)':<20} {'Error Abs.':<15}\n")
             self.txt_train.insert(tk.END, "-"*70 + "\n")
-            Yd = self.Y_train.flatten()
-            Yr = eval_train["Yr"]
-            for i in range(min(10, len(Yd))):
-                err = abs(Yd[i] - Yr[i])
-                self.txt_train.insert(tk.END, f"{i+1:<10} {Yd[i]:<20.8f} {Yr[i]:<20.8f} {err:<20.8f}\n")
+
+            Yd_train = self.Y_train.flatten()
+            Yr_train = eval_train["Yr"]
+            for i in range(len(Yd_train)):
+                err = abs(Yd_train[i] - Yr_train[i])
+                self.txt_train.insert(tk.END, f"{i+1:<10} {Yd_train[i]:<20.8f} {Yr_train[i]:<20.8f} {err:<15.8f}\n")
+            self.txt_train.insert(tk.END, "\n")
+
+            self.txt_train.insert(tk.END, "🔎 DETALLE DE SALIDAS (Prueba):\n")
+            self.txt_train.insert(tk.END, f"{'Patrón':<10} {'Yd (Real)':<20} {'Yr (Predicha)':<20} {'Error Abs.':<15}\n")
+            self.txt_train.insert(tk.END, "-"*70 + "\n")
+
+            Yd_test = self.Y_test.flatten()
+            Yr_test = eval_test["Yr"]
+            for i in range(len(Yd_test)):
+                err = abs(Yd_test[i] - Yr_test[i])
+                self.txt_train.insert(tk.END, f"{i+1:<10} {Yd_test[i]:<20.8f} {Yr_test[i]:<20.8f} {err:<15.8f}\n")
             self.txt_train.insert(tk.END, "\n")
 
             # ============================================================
-            # PASO 7: Verificación de convergencia
+            # CONVERGENCIA FINAL
             # ============================================================
             self.txt_train.insert(tk.END, "✅ PASO 10: Verificación de Convergencia\n")
             conv, msg = self.model.check_convergence(eval_train['EG'], self.error_opt_var.get())
             self.txt_train.insert(tk.END, f"  {msg}\n\n")
+
+            self.txt_train.insert(tk.END, "📋 RESUMEN FINAL DEL MODELO:\n")
+            self.txt_train.insert(tk.END, f"  • Centros radiales: {self.model.n_centers}\n")
+            self.txt_train.insert(tk.END, f"  • Patrones de entrenamiento: {len(self.X_train)}\n")
+            self.txt_train.insert(tk.END, f"  • Patrones de prueba: {len(self.X_test)}\n")
+            self.txt_train.insert(tk.END, f"  • Error óptimo configurado: {self.error_opt_var.get()}\n")
+            self.txt_train.insert(tk.END, f"  • Convergencia: {'✅ Sí' if conv else '❌ No'}\n\n")
 
             # ============================================================
             # PASO 8: Guardar resultados
@@ -524,27 +716,17 @@ class RBFApp(tk.Tk):
                 "convergencia_train": conv,
                 "EG_test": eval_test["EG"],
                 "MAE_test": eval_test["MAE"],
-                "RMSE_test": eval_test["RMSE"],
-                "Yd_train": self.Y_train.flatten(),
-                "Yr_train": eval_train["Yr"],
-                "errors_train": eval_train["errors_per_pattern"],
-                "Yd_test": self.Y_test.flatten(),
-                "Yr_test": eval_test["Yr"],
-                "errors_test": eval_test["errors_per_pattern"]
+                "RMSE_test": eval_test["RMSE"]
             }
 
             json_path, csv_path = save_results(results)
             self.txt_train.insert(tk.END, f"💾 Resultados guardados:\n")
             self.txt_train.insert(tk.END, f"  • JSON: {json_path}\n")
-            self.txt_train.insert(tk.END, f"  • CSV Train: {csv_path.replace('.csv', '_train.csv')}\n")
-            self.txt_train.insert(tk.END, f"  • CSV Test: {csv_path.replace('.csv', '_test.csv')}\n\n")
+            self.txt_train.insert(tk.END, f"  • CSV:  {csv_path}\n\n")
 
-            # ============================================================
-            # FINAL
-            # ============================================================
-            self.txt_train.insert(tk.END, "="*80 + "\n")
+            self.txt_train.insert(tk.END, "=" * 80 + "\n")
             self.txt_train.insert(tk.END, "✅ ENTRENAMIENTO COMPLETADO EXITOSAMENTE\n")
-            self.txt_train.insert(tk.END, "="*80 + "\n")
+            self.txt_train.insert(tk.END, "=" * 80 + "\n")
 
             messagebox.showinfo("Éxito", "Modelo entrenado correctamente")
 
@@ -552,51 +734,7 @@ class RBFApp(tk.Tk):
             messagebox.showerror("Error", f"Error durante entrenamiento:\n{str(e)}")
             import traceback
             traceback.print_exc()
-
-    def save_model_dialog(self):
-        if self.model is None or not self.model.trained:
-            messagebox.showwarning("Aviso", "No hay modelo entrenado para guardar")
-            return
-        
-        base_name = filedialog.asksaveasfilename(
-            defaultextension="",
-            filetypes=[("Todos", "*.*")],
-            initialfile="modelo_rbf"
-        )
-        
-        if not base_name:
-            return
-        
-        try:
-            # Guardar en JSON y CSV
-            paths = save_model_json_csv(
-                self.model, self.scaler, self.meta, self.last_eval, 
-                base_name=os.path.basename(base_name)
-            )
-            
-            msg = f"✅ Modelo guardado:\n\n"
-            msg += f"• JSON: {paths[0]}\n"
-            msg += f"• Centros CSV: {paths[1]}\n"
-            msg += f"• Pesos CSV: {paths[2]}"
-            
-            messagebox.showinfo("Guardado", msg)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def load_model_dialog(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json")],
-            initialdir="modelos"
-        )
-        
-        if not path:
-            return
-        
-        try:
-            self.model, self.scaler, self.meta, self.last_eval = load_model_json(path)
-            messagebox.showinfo("Cargado", f"✅ Modelo cargado desde:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Error al cargar modelo:\n{str(e)}")
+                
 
     def upload_model_to_drive(self):
         if not Pydrive_available:
@@ -622,28 +760,41 @@ class RBFApp(tk.Tk):
     # ==================== TAB 4: SIMULACIÓN ====================
     def _build_tab_sim(self):
         f = self.tab_sim
-        
         ttk.Label(f, text="Simulación y Predicción", style="Title.TLabel").pack(pady=10)
-        
+
+        # ------------------------------------------------------------
+        # Botón para cargar modelo
+        # ------------------------------------------------------------
+        frm_top = ttk.Frame(f)
+        frm_top.pack(fill="x", padx=20, pady=10)
+
+        ttk.Button(
+            frm_top,
+            text="📂 Cargar Modelo (JSON/CSV)",
+            command=self.load_model_dialog,
+            width=25
+        ).pack(side="left", padx=5)
+
+        # ------------------------------------------------------------
         # Simulación manual
+        # ------------------------------------------------------------
         frm_manual = ttk.LabelFrame(f, text="✏️ Simulación Manual", padding=15)
         frm_manual.pack(fill="x", padx=20, pady=10)
-        
+
         ttk.Label(frm_manual, text="Entrada (valores separados por comas):").pack(anchor="w", pady=5)
         self.sim_entry = ttk.Entry(frm_manual, width=80)
         self.sim_entry.pack(fill="x", pady=5)
-        
-        ttk.Button(frm_manual, text="🔍 Predecir", command=self.simulate_manual).pack(pady=5)
-        
-        # Simulación automática
-        frm_auto = ttk.LabelFrame(f, text="🤖 Simulación Automática", padding=15)
-        frm_auto.pack(fill="x", padx=20, pady=10)
-        
-        ttk.Button(frm_auto, text="📊 Simular conjunto de prueba", 
-                  command=self.simulate_test, width=30).pack(pady=5)
-        
+
+        ttk.Button(
+            frm_manual,
+            text="🔍 Predecir",
+            command=self.simulate_manual
+        ).pack(pady=5)
+
+        # ------------------------------------------------------------
         # Resultados
-        ttk.Label(f, text="📋 Resultados de Simulación:").pack(anchor="w", padx=20, pady=(10,5))
+        # ------------------------------------------------------------
+        ttk.Label(f, text="📋 Resultados de Simulación:").pack(anchor="w", padx=20, pady=(10, 5))
         self.txt_sim = tk.Text(f, height=20, width=120, font=("Consolas", 9))
         self.txt_sim.pack(padx=20, pady=5, fill="both", expand=True)
 
@@ -669,39 +820,175 @@ class RBFApp(tk.Tk):
             self.txt_sim.insert(tk.END, "-"*80 + "\n")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+            
+    def save_model_dialog(self):
+            """Guarda el modelo entrenado en un solo archivo JSON o CSV completo (centros, pesos, métricas, dataset, etc.)"""
+            if self.model is None or not getattr(self.model, "trained", False):
+                messagebox.showwarning("Aviso", "⚠️ No hay modelo entrenado para guardar.")
+                return
 
-    def simulate_test(self):
-        if self.model is None or not self.model.trained:
-            messagebox.showwarning("Aviso", "Entrene un modelo primero")
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[
+                    ("Modelo completo JSON", "*.json"),
+                    ("Modelo completo CSV", "*.csv"),
+                ],
+                initialfile="modelo_completo_rbf"
+            )
+
+            if not file_path:
+                return
+
+            try:
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                ext = os.path.splitext(file_path)[1].lower()
+                os.makedirs(MODELS_DIR, exist_ok=True)
+
+                # 🔹 Conversión segura a tipos serializables
+                def safe_convert(obj):
+                    import numpy as np
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, (np.float32, np.float64)):
+                        return float(obj)
+                    elif isinstance(obj, (np.int32, np.int64)):
+                        return int(obj)
+                    elif isinstance(obj, dict):
+                        return {k: safe_convert(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [safe_convert(x) for x in obj]
+                    else:
+                        return obj
+
+                # Obtener matriz A si existe
+                A_path = os.path.join(RESULTS_DIR, "matriz_A.csv")
+                A = pd.read_csv(A_path).values if os.path.exists(A_path) else None
+
+                # Datos completos del modelo
+                full_data = {
+                    "config": {
+                        "n_centers": int(getattr(self.model, "n_centers", 0)),
+                        "error_opt": float(self.error_opt_var.get()),
+                        "train_pct": self.train_pct_var.get(),
+                    },
+                    "centers": safe_convert(self.model.centers) if self.model.centers is not None else [],
+                    "weights": safe_convert(self.model.weights) if self.model.weights is not None else [],
+                    "matriz_A": safe_convert(A) if A is not None else [],
+                    "scaler_mean": safe_convert(self.scaler.mean_) if self.scaler else None,
+                    "scaler_std": safe_convert(self.scaler.scale_) if self.scaler else None,
+                    "meta": safe_convert(self.meta),
+                    "train": safe_convert(self.last_eval.get("train", {})) if self.last_eval else {},
+                    "test": safe_convert(self.last_eval.get("test", {})) if self.last_eval else {}
+                }
+
+                # ---------------------- GUARDAR JSON ----------------------
+                if ext == ".json":
+                    with open(file_path, "w", encoding="utf8") as f:
+                        json.dump(full_data, f, indent=2, ensure_ascii=False)
+                    messagebox.showinfo("Guardado", f"✅ Modelo completo guardado en:\n{file_path}")
+
+                # ---------------------- GUARDAR CSV ----------------------
+                elif ext == ".csv":
+                    flat_data = []
+                    for k, v in full_data.items():
+                        if isinstance(v, dict):
+                            for subk, subv in v.items():
+                                flat_data.append({"Sección": k, "Campo": subk, "Valor": json.dumps(subv)})
+                        else:
+                            flat_data.append({"Sección": "root", "Campo": k, "Valor": json.dumps(v)})
+
+                    pd.DataFrame(flat_data).to_csv(file_path, index=False)
+                    messagebox.showinfo("Guardado", f"✅ Modelo completo guardado en:\n{file_path}")
+
+                else:
+                    messagebox.showerror("Error", "Formato no soportado (use .json o .csv).")
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                messagebox.showerror("Error", f"Error al guardar modelo:\n{str(e)}")
+
+
+    def load_model_dialog(self):
+        """Carga un modelo completo (JSON o CSV) y habilita simulación sin reentrenar."""
+        path = filedialog.askopenfilename(
+            title="Seleccionar modelo guardado",
+            filetypes=[("Modelos RBF", "*.json *.csv")],
+            initialdir="modelos"
+        )
+
+        if not path:
             return
-        
-        if self.X_test is None:
-            messagebox.showwarning("Aviso", "No hay conjunto de prueba disponible")
-            return
-        
+
         try:
-            Yr = self.model.predict(self.X_test)
-            Yd = self.Y_test.flatten()
-            
-            self.txt_sim.delete("1.0", tk.END)
-            self.txt_sim.insert(tk.END, "="*80 + "\n")
-            self.txt_sim.insert(tk.END, "SIMULACIÓN SOBRE CONJUNTO DE PRUEBA\n")
-            self.txt_sim.insert(tk.END, "="*80 + "\n\n")
-            
-            self.txt_sim.insert(tk.END, f"{'Patrón':<10} {'Yd (Real)':<15} {'Yr (Pred.)':<15} {'Error':<15}\n")
-            self.txt_sim.insert(tk.END, "-"*80 + "\n")
-            
-            for i, (yd, yr) in enumerate(zip(Yd[:30], Yr[:30]), 1):
-                error = abs(yd - yr)
-                self.txt_sim.insert(tk.END, f"{i:<10} {yd:<15.8f} {yr:<15.8f} {error:<15.8f}\n")
-            
-            if len(Yd) > 30:
-                self.txt_sim.insert(tk.END, f"\n... y {len(Yd)-30} patrones más\n")
-            
-            self.txt_sim.insert(tk.END, "\n" + "="*80 + "\n")
-            
+            ext = os.path.splitext(path)[1].lower()
+
+            # ---------------------- CARGAR JSON ----------------------
+            if ext == ".json":
+                with open(path, "r", encoding="utf8") as f:
+                    data = json.load(f)
+
+            # ---------------------- CARGAR CSV ----------------------
+            elif ext == ".csv":
+                df = pd.read_csv(path)
+                data = {}
+                for _, row in df.iterrows():
+                    section = row["Sección"]
+                    field = row["Campo"]
+                    value = json.loads(row["Valor"])
+                    if section not in data:
+                        data[section] = {}
+                    data[section][field] = value
+            else:
+                messagebox.showerror("Error", "Formato no soportado.")
+                return
+
+            # ---------------------- RECONSTRUIR MODELO ----------------------
+            from .model_rbf import RBFModel
+            self.model = RBFModel(n_centers=int(data["config"]["n_centers"]))
+            self.model.centers = np.array(data["centers"])
+            self.model.weights = np.array(data["weights"]).flatten()
+            self.model.trained = True
+
+            # Escalador
+            self.scaler = None
+            if data.get("scaler_mean") and data.get("scaler_std"):
+                from sklearn.preprocessing import StandardScaler
+                self.scaler = StandardScaler()
+                self.scaler.mean_ = np.array(data["scaler_mean"])
+                self.scaler.scale_ = np.array(data["scaler_std"])
+                self.scaler.n_features_in_ = len(self.scaler.mean_)
+
+            # Metadatos y evaluación
+            self.meta = data.get("meta", {})
+            self.last_eval = {"train": data.get("train", {}), "test": data.get("test", {})}
+
+            # Activar simulación sin entrenamiento
+            if hasattr(self, "btn_predict_manual"):
+                self.btn_predict_manual.config(state="normal")
+            if hasattr(self, "btn_simulate_test"):
+                self.btn_simulate_test.config(state="normal")
+
+            # Mostrar resumen
+            info = f"✅ Modelo cargado: {os.path.basename(path)}\n"
+            info += f"• Centros radiales: {self.model.n_centers}\n"
+            info += f"• Pesos: {len(self.model.weights)}\n"
+            if self.last_eval:
+                tr = self.last_eval["train"]
+                ts = self.last_eval["test"]
+                info += "\n📈 MÉTRICAS:\n"
+                info += f"  Entrenamiento → EG={tr.get('EG', 0):.6f}, MAE={tr.get('MAE', 0):.6f}, RMSE={tr.get('RMSE', 0):.6f}\n"
+                info += f"  Prueba        → EG={ts.get('EG', 0):.6f}, MAE={ts.get('MAE', 0):.6f}, RMSE={ts.get('RMSE', 0):.6f}\n"
+
+            if hasattr(self, "lbl_model_info"):
+                self.lbl_model_info.config(text=info)
+
+            messagebox.showinfo("Modelo cargado", f"✅ Modelo cargado correctamente:\n{os.path.basename(path)}\n\nYa puedes simular sin reentrenar.")
+
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            import traceback; traceback.print_exc()
+            messagebox.showerror("Error", f"No se pudo cargar el modelo:\n{str(e)}")
+
+    
 
     # ==================== TAB 5: GRÁFICAS ====================
     def _build_tab_graph(self):
