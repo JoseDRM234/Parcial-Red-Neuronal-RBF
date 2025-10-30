@@ -14,7 +14,7 @@ Aplicación de escritorio para entrenar y simular una Red RBF:
 - Añadir centros manualmente (o random)
 - Entrena (una sola iteración, mínimos cuadrados)
 - Muestra: Centros finales, Pesos finales, Matriz A, EG / MAE / RMSE
-- Guarda resultados en CSV/JSON y modelo .pkl (para cargar y sólo simular)
+- Guarda resultados en CSV/JSON y (para cargar y sólo simular)
 - Subida/descarga a Google Drive (opcional, requiere client_secrets.json + PyDrive2)
 
 Ejecución
