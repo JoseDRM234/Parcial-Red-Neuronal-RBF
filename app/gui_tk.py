@@ -208,6 +208,53 @@ class RBFApp(tk.Tk):
             traceback.print_exc()
             messagebox.showerror("Error Drive", f"❌ Error durante autenticación:\n{str(e)}")
 
+    def show_matrix_popup(self, A, cols_header):
+        """Muestra la matriz A en una ventana emergente tipo tabla"""
+        import tkinter as tk
+        from tkinter import ttk
+
+        win = tk.Toplevel(self)
+        win.title("📋 Matriz A - Vista Completa")
+        win.geometry("1000x600")
+
+        ttk.Label(win, text="📋 Matriz A (activaciones radiales)", font=("Segoe UI", 11, "bold")).pack(pady=8)
+
+        # Frame principal con scroll
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Scrollbars
+        scroll_y = ttk.Scrollbar(frame, orient="vertical")
+        scroll_y.pack(side="right", fill="y")
+        scroll_x = ttk.Scrollbar(frame, orient="horizontal")
+        scroll_x.pack(side="bottom", fill="x")
+
+        # Treeview (tabla)
+        tree = ttk.Treeview(
+            frame,
+            columns=cols_header,
+            show="headings",
+            yscrollcommand=scroll_y.set,
+            xscrollcommand=scroll_x.set,
+            height=25
+        )
+
+        # Configurar encabezados
+        for col in cols_header:
+            tree.heading(col, text=col)
+            tree.column(col, width=100, anchor="center")
+
+        # Insertar filas
+        for i, row in enumerate(A):
+            formatted = [f"{v:.6f}" for v in row]
+            tree.insert("", "end", values=formatted)
+
+        # Enlazar scrolls
+        tree.pack(fill="both", expand=True)
+        scroll_y.config(command=tree.yview)
+        scroll_x.config(command=tree.xview)
+
+        ttk.Button(win, text="Cerrar", command=win.destroy).pack(pady=5)
 
 # ==================== Dentro de la clase RBFApp ====================
     def load_from_drive_direct(self):
@@ -218,11 +265,12 @@ class RBFApp(tk.Tk):
 
         idx = sel[0]
         title, fid, mime = self.drive_files[idx]
+
         try:
             df_or_json = read_file_from_drive(fid)
 
+            # 🔹 Si es un modelo (contiene pesos y centros)
             if isinstance(df_or_json, dict) and "weights" in df_or_json:
-                # Cargar modelo desde JSON
                 from .model_rbf import RBFModel
                 import numpy as np
                 from sklearn.preprocessing import StandardScaler
@@ -247,14 +295,31 @@ class RBFApp(tk.Tk):
                 messagebox.showinfo("Modelo cargado", f"✅ Modelo '{title}' abierto desde Drive")
 
             else:
-                # Cargar dataset desde CSV
+                # 🔹 Dataset (CSV, Excel o JSON)
                 df = df_or_json
                 self.X, self.Y, self.meta = detect_xy_from_df(df)
                 self.X, self.scaler = preprocess(self.X)
-                messagebox.showinfo("Dataset cargado", f"✅ Dataset '{title}' abierto desde Drive")
+
+                # 🔸 Mostrar la misma información que el modo local
+                self.load_info.delete("1.0", tk.END)
+                self.load_info.insert(tk.END, f"✅ Dataset cargado desde Drive: {title}\n\n")
+                self.load_info.insert(tk.END, f"📊 Estadísticas:\n")
+                self.load_info.insert(tk.END, f"  - Patrones totales: {self.meta['n_patterns']}\n")
+                self.load_info.insert(tk.END, f"  - Número de entradas: {self.meta['n_inputs']}\n")
+                self.load_info.insert(tk.END, f"  - Número de salidas: {self.meta['n_outputs']}\n")
+                self.load_info.insert(tk.END, f"  - Columnas X: {self.meta['X_cols']}\n")
+                self.load_info.insert(tk.END, f"  - Columna Y: {self.meta['Y_col']}\n\n")
+                self.load_info.insert(tk.END, "✅ Preprocesamiento: Normalización Z-score aplicada\n")
+
+                # 🔸 Reiniciar modelo y resultados anteriores
+                self.model = None
+                self.last_eval = None
+
+                messagebox.showinfo("Éxito", f"✅ Dataset '{title}' cargado correctamente desde Drive")
 
         except Exception as e:
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             messagebox.showerror("Error", f"❌ Error al leer archivo desde Drive:\n{str(e)}")
 
     def download_selected_from_drive(self):
@@ -522,6 +587,10 @@ class RBFApp(tk.Tk):
             command=self.upload_model_to_drive,
             width=15
         ).pack(side="left", padx=5)
+         # Botón que mostrará la matriz (inicialmente deshabilitado)
+        self.btn_show_matrix = ttk.Button(f, text="📊 Ver Matriz A Completa", state="disabled",
+                                        command=self._show_matrix_popup_event)
+        self.btn_show_matrix.pack(pady=5)
 
         # ------------------------------------------------------------
         # Área de resultados (Log de entrenamiento)
@@ -529,6 +598,13 @@ class RBFApp(tk.Tk):
         ttk.Label(f, text="📋 Log de Entrenamiento:").pack(anchor="w", padx=20, pady=(10, 5))
         self.txt_train = tk.Text(f, height=28, width=120, font=("Consolas", 9))
         self.txt_train.pack(padx=20, pady=5, fill="both", expand=True)
+
+    def _show_matrix_popup_event(self):
+        """Evento al presionar el botón de ver matriz completa"""
+        if hasattr(self, "A") and self.A is not None:
+            self.show_matrix_popup(self.A, self.cols_header)
+        else:
+            messagebox.showwarning("Aviso", "Primero entrene el modelo para generar la matriz A.")
 
     def train_model(self):
         if self.X is None:
@@ -605,15 +681,18 @@ class RBFApp(tk.Tk):
             # Construir encabezados de columnas
             cols_header = ["Bias"] + [f"Φ{j+1}" for j in range(self.model.n_centers)]
 
-            # Mostrar matriz A completa en el cuadro de texto
-            self.txt_train.insert(tk.END, "📋 MATRIZ A COMPLETA:\n")
+            # Mostrar primeras 10 filas en el log (resumen)
+            self.txt_train.insert(tk.END, "📋 MATRIZ A (primeras 10 filas):\n")
             self.txt_train.insert(tk.END, "-" * 100 + "\n")
             self.txt_train.insert(tk.END, " | ".join([f"{h:^12}" for h in cols_header]) + "\n")
             self.txt_train.insert(tk.END, "-" * 100 + "\n")
 
-            for i, row in enumerate(A):
+            for i, row in enumerate(A[:10]):  # Solo 10 filas para no saturar
                 formatted_row = " | ".join([f"{val:>12.6f}" for val in row])
                 self.txt_train.insert(tk.END, f"Fila {i+1:>3}: {formatted_row}\n")
+
+            if A.shape[0] > 10:
+                self.txt_train.insert(tk.END, f"... ({A.shape[0]-10} filas adicionales ocultas)\n")
 
             self.txt_train.insert(tk.END, "-" * 100 + "\n\n")
 
@@ -623,6 +702,7 @@ class RBFApp(tk.Tk):
             path_A = os.path.join(RESULTS_DIR, "matriz_A.csv")
             df_A.to_csv(path_A, index=False)
             self.txt_train.insert(tk.END, f"💾 Matriz A guardada en: {path_A}\n\n")
+        
 
             # ============================================================
             # PASO 6: Cálculo de Pesos
@@ -727,6 +807,11 @@ class RBFApp(tk.Tk):
             self.txt_train.insert(tk.END, "=" * 80 + "\n")
             self.txt_train.insert(tk.END, "✅ ENTRENAMIENTO COMPLETADO EXITOSAMENTE\n")
             self.txt_train.insert(tk.END, "=" * 80 + "\n")
+            
+            # Activar botón de visualización de matriz
+            self.A = A  # Guardamos la matriz en el objeto para usarla luego
+            self.cols_header = cols_header
+            self.btn_show_matrix.config(state="normal")
 
             messagebox.showinfo("Éxito", "Modelo entrenado correctamente")
 
