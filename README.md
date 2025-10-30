@@ -10,7 +10,7 @@ Descripción
 -----------
 Aplicación de escritorio para entrenar y simular una Red RBF:
 - Carga dataset (local / Drive)
-- Definir número inicial de centros (2 o más)
+- Definir número inicial de centros (Depende de las entradas del dataset)
 - Añadir centros manualmente (o random)
 - Entrena (una sola iteración, mínimos cuadrados)
 - Muestra: Centros finales, Pesos finales, Matriz A, EG / MAE / RMSE
